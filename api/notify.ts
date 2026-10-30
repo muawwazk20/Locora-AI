@@ -1,0 +1,656 @@
+// Shared server helpers for Locora security fix — NO IMPORTS, NO node:crypto.
+// This file is inlined into each api/*.ts function because this project's
+// Vercel functions have historically been self-contained (no static imports:
+// the previous _lib import and the node:crypto import both failed live with
+// FUNCTION_INVOCATION_FAILED, while the import-free api/auth/google.ts worked).
+// Crypto uses only WebCrypto (globalThis.crypto.subtle) + btoa/atob, which
+// work in Node and Edge runtimes without any import. No secrets are hardcoded:
+// SESSION_SECRET, SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY come only from
+// Vercel env vars. If SESSION_SECRET is missing, session verification fails
+// closed (null) and login/signup/Google callback must refuse to issue a session.
+export const ADMIN_EMAILS = ["mr.adeen946@gmail.com", "ayan.work937@gmail.com"];
+
+export function getEnv(name: string): string {
+  try {
+    const env = (globalThis as any).process?.env;
+    return (env && env[name]) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function norm(email: string): string {
+  return (email || "").trim().toLowerCase();
+}
+
+export function isEmail(s: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^@\s@]+$/.test(s || "");
+}
+
+export function isAdmin(email: string): boolean {
+  return ADMIN_EMAILS.indexOf(norm(email)) !== -1;
+}
+
+export function sendJson(res: any, status: number, obj: any, extraHeaders?: Record<string, string>): void {
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Cache-Control": "no-store",
+    ...(extraHeaders || {}),
+  });
+  res.end(JSON.stringify(obj));
+}
+
+export function parseCookies(req: any): Record<string, string> {
+  const out: Record<string, string> = {};
+  const header = req.headers?.cookie || "";
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx > -1) out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return out;
+}
+
+export function getClientIp(req: any): string {
+  const fwd = req.headers?.["x-forwarded-for"] || "";
+  if (typeof fwd === "string" && fwd.trim()) return fwd.split(",")[0].trim();
+  return req.headers?.["x-real-ip"] || "unknown";
+}
+
+function bytesToB64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function b64urlToBytes(text: string): Uint8Array {
+  const b64 = text.replace(/-/g, "+").replace(/_/g, "/") + "==".slice(0, (4 - (text.length % 4)) % 4);
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function b64urlEncode(text: string): string {
+  return bytesToB64url(new TextEncoder().encode(text));
+}
+function b64urlDecode(text: string): string {
+  return new TextDecoder().decode(b64urlToBytes(text));
+}
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+function randomBytes(n: number): Uint8Array {
+  const out = new Uint8Array(n);
+  (globalThis as any).crypto.getRandomValues(out);
+  return out;
+}
+function ctEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await (globalThis as any).crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return bytesToHex(new Uint8Array(digest));
+}
+async function hmacB64url(secret: string, data: string): Promise<string> {
+  const key = await (globalThis as any).crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await (globalThis as any).crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
+  return bytesToB64url(new Uint8Array(sig));
+}
+
+export interface SessionUser { email: string; role: string; authProvider: string; sessionVersion?: number; }
+
+export async function signSession(email: string, role: string, authProvider: string, sessionVersion = 0): Promise<string> {
+  const secret = getEnv("SESSION_SECRET");
+  if (!secret) throw new Error("SESSION_SECRET is not configured");
+  const header = b64urlEncode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const now = Math.floor(Date.now() / 1000);
+  const payload = b64urlEncode(JSON.stringify({
+    email: norm(email), role: role || "attendee", authProvider: authProvider || "local",
+    v: sessionVersion || 0, iat: now, exp: now + 7 * 24 * 3600,
+  }));
+  const sig = await hmacB64url(secret, header + "." + payload);
+  return header + "." + payload + "." + sig;
+}
+
+export async function verifySession(req: any): Promise<SessionUser | null> {
+  try {
+    const secret = getEnv("SESSION_SECRET");
+    if (!secret) return null;
+    const token = parseCookies(req).locora_session;
+    if (!token) return null;
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const expected = await hmacB64url(secret, parts[0] + "." + parts[1]);
+    if (!ctEqual(expected, parts[2])) return null;
+    const payload = JSON.parse(b64urlDecode(parts[1]));
+    if (!payload.email || !isEmail(payload.email) || !payload.exp || payload.exp * 1000 < Date.now()) return null;
+    const email = norm(payload.email);
+    try {
+      const tokenHash = await sha256Hex(token);
+      const rev = await fetchJson(`${supabaseBase()}/rest/v1/revoked_tokens?id=eq.${encodeURIComponent(tokenHash)}&select=data`, { headers: supabaseHeaders() });
+      if (rev.ok && Array.isArray(rev.body) && rev.body.length > 0) {
+        const exp = rev.body[0].data?.expiresAt;
+        if (!exp || new Date(exp).getTime() > Date.now()) return null;
+      }
+    } catch {}
+    try {
+      const userRow = await loadUserByEmail(email);
+      if (userRow && userRow.data && typeof userRow.data.sessionVersion === "number") {
+        const stored = userRow.data.sessionVersion;
+        if (payload.v === undefined) {
+          if (stored > 0) return null;
+        } else if (payload.v !== stored) {
+          return null;
+        }
+      }
+    } catch {}
+    return { email, role: payload.role || "attendee", authProvider: payload.authProvider || "local", sessionVersion: typeof payload.v === "number" ? payload.v : undefined };
+  } catch {
+    return null;
+  }
+}
+
+export async function revokeSessionToken(req: any): Promise<boolean> {
+  try {
+    const token = parseCookies(req).locora_session;
+    if (!token) return false;
+    const parts = token.split(".");
+    if (parts.length !== 3) return false;
+    let expIso = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+    try { expIso = new Date(JSON.parse(b64urlDecode(parts[1])).exp * 1000).toISOString(); } catch {}
+    const tokenHash = await sha256Hex(token);
+    const { ok } = await fetchJson(`${supabaseBase()}/rest/v1/revoked_tokens`, {
+      method: "POST",
+      headers: { ...supabaseHeaders(), Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify({ id: tokenHash, data: { tokenHash, email: norm(JSON.parse(b64urlDecode(parts[1])).email || ""), expiresAt: expIso } }),
+    });
+    return ok;
+  } catch { return false; }
+}
+
+function isSecureReq(req: any): boolean {
+  const proto = req.headers?.["x-forwarded-proto"];
+  const host = req.headers?.["x-forwarded-host"] || req.headers?.host || "";
+  return proto === "https" || (host !== "" && !host.includes("localhost") && !host.startsWith("127."));
+}
+
+export function sessionCookie(jwt: string, req: any): string {
+  return `locora_session=${jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${isSecureReq(req) ? "; Secure" : ""}`;
+}
+export function clearSessionCookie(req: any): string {
+  return `locora_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${isSecureReq(req) ? "; Secure" : ""}`;
+}
+
+// ---- Supabase ----
+export function supabaseHeaders(): Record<string, string> {
+  const key = getEnv("SUPABASE_SERVICE_ROLE_KEY");
+  return { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json", Prefer: "return=representation" };
+}
+export function supabaseBase(): string {
+  return getEnv("SUPABASE_URL").replace(/\/$/, "");
+}
+export async function fetchJson(url: string, init?: any): Promise<{ ok: boolean; status: number; body: any }> {
+  const res = await fetch(url, init);
+  let body: any = null;
+  try { body = await res.json(); } catch { body = null; }
+  return { ok: res.ok, status: res.status, body };
+}
+export function readBody(req: any): Promise<any> {
+  return new Promise((resolve) => {
+    try {
+      const b = (req as any).body;
+      if (b && typeof b === "object") return resolve(b);
+      if (typeof b === "string" && b.length > 0) {
+        try { return resolve(JSON.parse(b)); } catch { return resolve({}); }
+      }
+      let data = "";
+      const timer = setTimeout(() => resolve({}), 3000);
+      req.on("data", (chunk: any) => { data += chunk; });
+      req.on("end", () => { clearTimeout(timer); try { resolve(data ? JSON.parse(data) : {}); } catch { resolve({}); } });
+      req.on("error", () => { clearTimeout(timer); resolve({}); });
+    } catch { resolve({}); }
+  });
+}
+
+// ---- Passwords (PBKDF2-SHA256 via WebCrypto, per-user salt, constant-time compare) ----
+// Format: pbkdf2$<saltHex>$<hashHex>$100000. No live passwords exist yet
+// (locora_users table is new in this fix), so no scrypt migration is needed.
+export async function hashPassword(password: string): Promise<string> {
+  const salt = bytesToHex(randomBytes(16));
+  const key = await (globalThis as any).crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await (globalThis as any).crypto.subtle.deriveBits({ name: "PBKDF2", salt: hexToBytes(salt), iterations: 100000, hash: "SHA-256" }, key, 256);
+  return `pbkdf2$${salt}$${bytesToHex(new Uint8Array(bits))}$100000`;
+}
+export async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  try {
+    const parts = (stored || "").split("$");
+    if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+    const key = await (globalThis as any).crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+    const bits = await (globalThis as any).crypto.subtle.deriveBits({ name: "PBKDF2", salt: hexToBytes(parts[1]), iterations: parseInt(parts[3], 10) || 100000, hash: "SHA-256" }, key, 256);
+    return ctEqual(bytesToHex(new Uint8Array(bits)), parts[2]);
+  } catch { return false; }
+}
+export async function hashToken(raw: string): Promise<string> {
+  return sha256Hex(raw);
+}
+export function randomTokenHex(bytes = 32): string {
+  return bytesToHex(randomBytes(bytes));
+}
+
+// ---- Rate limiting (Supabase-backed counter, table rate_limits) ----
+export async function checkRateLimit(key: string, limit: number, windowMs: number): Promise<{ allowed: boolean; retryAfter: number; tableMissing: boolean }> {
+  try {
+    if (!supabaseBase() || !getEnv("SUPABASE_SERVICE_ROLE_KEY")) return { allowed: false, retryAfter: 0, tableMissing: true };
+    const url = `${supabaseBase()}/rest/v1/rate_limits?id=eq.${encodeURIComponent(key)}&select=data`;
+    const { ok, status, body } = await fetchJson(url, { headers: supabaseHeaders() });
+    if (!ok) {
+      if (status === 404 || status === 400) return { allowed: false, retryAfter: 0, tableMissing: true };
+      return { allowed: true, retryAfter: 0, tableMissing: false };
+    }
+    const now = Date.now();
+    const row = Array.isArray(body) && body.length > 0 ? body[0].data : null;
+    const windowStart = row && typeof row.windowStart === "number" ? row.windowStart : 0;
+    const count = row && typeof row.count === "number" ? row.count : 0;
+    if (windowStart && now - windowStart < windowMs && count >= limit) {
+      return { allowed: false, retryAfter: Math.ceil((windowStart + windowMs - now) / 1000), tableMissing: false };
+    }
+    const fresh = !windowStart || now - windowStart >= windowMs;
+    const next = { count: fresh ? 1 : count + 1, windowStart: fresh ? now : windowStart };
+    const up = await fetchJson(`${supabaseBase()}/rest/v1/rate_limits`, {
+      method: "POST",
+      headers: { ...supabaseHeaders(), Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify({ id: key, data: next }),
+    });
+    if (!up.ok && (up.status === 404 || up.status === 400)) return { allowed: false, retryAfter: 0, tableMissing: true };
+    return { allowed: true, retryAfter: 0, tableMissing: false };
+  } catch {
+    return { allowed: true, retryAfter: 0, tableMissing: false };
+  }
+}
+
+// ---- Events / organiser helpers ----
+export function organizerEmailOf(event: any): string {
+  return norm(event?.createdByEmail || event?.organizer?.email || "");
+}
+export function isEventOwner(event: any, email: string): boolean {
+  if (!event || !email) return false;
+  const e = norm(email);
+  if (event.createdByEmail) return norm(event.createdByEmail) === e;
+  return (event.organizer?.email || "") !== "" && norm(event.organizer.email) === e;
+}
+export function mayManageEvent(event: any, email: string): boolean {
+  if (!event || !email) return false;
+  if (isAdmin(email)) return true;
+  return isEventOwner(event, email);
+}
+export function stripEventPublic(event: any): any {
+  if (!event) return event;
+  const { createdByEmail: _c, upiId: _u, organizer, ...rest } = event;
+  let org = organizer;
+  if (organizer && typeof organizer === "object") {
+    const { email: _e, ...orgRest } = organizer;
+    org = orgRest;
+  }
+  return { ...rest, organizer: org };
+}
+export async function loadEvent(eventId: string): Promise<any | null> {
+  const { ok, body } = await fetchJson(
+    `${supabaseBase()}/rest/v1/events?id=eq.${encodeURIComponent(eventId)}&select=data`,
+    { headers: supabaseHeaders() },
+  );
+  if (!ok || !Array.isArray(body) || body.length === 0) return null;
+  return body[0].data;
+}
+export async function loadAllEvents(): Promise<any[]> {
+  const { ok, body } = await fetchJson(
+    `${supabaseBase()}/rest/v1/events?select=data&order=created_at.desc&limit=1000`,
+    { headers: supabaseHeaders() },
+  );
+  if (!ok || !Array.isArray(body)) return [];
+  return body.map((r: any) => r.data).filter(Boolean);
+}
+export async function isApprovedOrganizer(email: string): Promise<boolean> {
+  if (isAdmin(email)) return true;
+  try {
+    const { ok, body } = await fetchJson(
+      `${supabaseBase()}/rest/v1/organizer_access?email=eq.${encodeURIComponent(norm(email))}&select=data`,
+      { headers: supabaseHeaders() },
+    );
+    if (!ok || !Array.isArray(body) || body.length === 0) return false;
+    return body[0].data?.status === "approved";
+  } catch { return false; }
+}
+export async function loadUserByEmail(email: string): Promise<{ id: string; data: any } | null> {
+  const { ok, body } = await fetchJson(
+    `${supabaseBase()}/rest/v1/locora_users?select=id,data&data->>email=eq.${encodeURIComponent(norm(email))}`,
+    { headers: supabaseHeaders() },
+  );
+  if (!ok || !Array.isArray(body) || body.length === 0) return null;
+  return body[0];
+}
+export function esc(s: string): string {
+  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// POST /api/notify — account emails: welcome + new sign-in alerts.
+//
+//   POST /api/notify { action: "welcome", email, name? }
+//     -> welcome email, sent at most ONCE per email address, ever.
+//   POST /api/notify { action: "login", email }
+//     -> "new sign-in" email with device + location, at most 5 per
+//        email per hour.
+//
+// Callers (the app after a local sign-in/sign-up, and the Google
+// callback page after a Google sign-in) fire this and ignore failures:
+// account emails must never break sign-in or sign-up, so this always
+// answers 200 JSON { mailed: boolean, reason?: string } for a
+// well-formed request, and only 400/405 for a malformed one.
+//
+// SECURITY FIX (production hardening): this endpoint is now SESSION-
+// GATED. A valid locora_session cookie is required, and body.email
+// must equal the session email, otherwise 401 — an unauthenticated
+// caller can no longer trigger mail to any address. The caps above
+// (enforced in Supabase) still apply, and every template is fixed
+// (the only caller-controlled text is the display name, HTML-escaped
+// and length-limited). Without the email_log table this fails CLOSED:
+// no mail is sent, so a missing table can never become an open relay.
+// Callers (fire-and-forget, failures ignored, so a 401 never breaks
+// sign-in): src/services/auth-service.ts after a local sign-in/sign-up
+// (cookie already set by /api/auth/login or /api/auth/signup), and the
+// Google callback page after a Google sign-in (cookie set by the
+// callback response before its script runs).
+//
+// Location is best-effort: the sign-in IP is looked up via ip-api
+// (server-side, 3s timeout, private IPs skipped). If the lookup fails,
+// the email says "Unknown location" rather than guessing.
+//
+// This is a Vercel Serverless Function, self-contained (no imports
+// from api/_lib), following the same shape as api/registrations.ts.
+// Sending uses Gmail SMTP via nodemailer, dynamically imported only
+// when a send actually happens, gated on GMAIL_USER / GMAIL_APP_PASSWORD.
+
+
+
+
+
+function validEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+
+function cleanName(name: string): string {
+  return (name || "").replace(/[\r\n]+/g, " ").trim().slice(0, 100);
+}
+
+// Locora email theme: the website's own palette — warm parchment page,
+// white card, deep forest headings, terracotta accent, serif wordmark.
+// Plain-text versions stay unchanged; only the HTML part is themed.
+// All styles are inline (email clients strip <style> blocks). The logo
+// loads from the live site; if an inbox blocks images, the "Locora"
+// wordmark beside it still reads.
+const SITE_URL = "https://locora-hyperlocal.vercel.app";
+
+function emailLayout(title: string, inner: string): string {
+  return (
+    `<div style="background:#FAF8F5;padding:24px 12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">` +
+    `<div style="max-width:600px;margin:0 auto;background:#ffffff;border:1px solid #E7E3DB;border-radius:16px;overflow:hidden;">` +
+    `<div style="height:4px;background:#C25E00;"></div>` +
+    `<div style="padding:32px;">` +
+    `<div style="margin-bottom:24px;">` +
+    `<img src="${SITE_URL}/locora-logo.png" alt="Locora" width="36" height="36" style="vertical-align:middle;border-radius:8px;" />` +
+    `<span style="font-family:Georgia,'Times New Roman',serif;font-size:28px;font-weight:700;color:#1E3F35;vertical-align:middle;margin-left:10px;">Locora</span>` +
+    `</div>` +
+    `<h1 style="font-family:Georgia,'Times New Roman',serif;font-size:22px;line-height:1.3;color:#1E3F35;margin:0 0 16px;">${title}</h1>` +
+    inner +
+    `<div style="margin-top:24px;padding-top:16px;border-top:1px solid #E7E3DB;font-size:12px;line-height:1.5;color:#5F635D;">Locora · Hyperlocal Event Discovery &amp; Community Engagement<br />This is an automated email — please don't reply.</div>` +
+    `</div></div></div>`
+  );
+}
+
+function bodyText(s: string): string {
+  return `<p style="margin:0 0 12px;font-size:15px;line-height:1.6;color:#1E2320;">${s}</p>`;
+}
+
+function detailRow(label: string, value: string): string {
+  return `<p style="margin:0 0 10px;font-size:15px;line-height:1.6;color:#1E2320;"><span style="color:#5F635D;">${label}:</span> ${value}</p>`;
+}
+
+function primaryButton(label: string, href: string): string {
+  return `<p style="margin:20px 0 0;"><a href="${href}" style="display:inline-block;background:#1E3F35;color:#ffffff;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:600;font-size:15px;">${label}</a></p>`;
+}
+
+function secondaryButton(label: string, href: string): string {
+  return `<a href="${href}" style="display:inline-block;background:#ffffff;color:#1E3F35;border:1px solid #1E3F35;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:600;font-size:15px;">${label}</a>`;
+}
+
+
+
+
+
+// Best-effort "Browser on OS" from a User-Agent string. Unknown agents
+// stay "Unknown device" rather than a guessed value.
+export function parseDevice(ua: string): string {
+  const u = ua || "";
+  let browser = "Unknown browser";
+  if (/Edg\//.test(u)) browser = "Edge";
+  else if (/OPR\//.test(u)) browser = "Opera";
+  else if (/SamsungBrowser\//.test(u)) browser = "Samsung Internet";
+  else if (/CriOS/.test(u)) browser = "Chrome (iOS)";
+  else if (/FxiOS/.test(u)) browser = "Firefox (iOS)";
+  else if (/Chrome\//.test(u)) browser = "Chrome";
+  else if (/Firefox\//.test(u)) browser = "Firefox";
+  else if (/Safari\//.test(u) && /Version\//.test(u)) browser = "Safari";
+  let os = "Unknown device";
+  if (/Windows NT/.test(u)) os = "Windows";
+  else if (/Android/.test(u)) os = "Android";
+  else if (/iPhone|iPad/.test(u)) os = "iOS";
+  else if (/Mac OS X/.test(u)) os = "macOS";
+  else if (/Linux/.test(u)) os = "Linux";
+  if (browser === "Unknown browser" && os === "Unknown device") return "Unknown device";
+  return `${browser} on ${os}`;
+}
+
+async function getLocation(ip: string): Promise<string> {
+  if (!ip) return "";
+  if (/^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1|fe80:)/.test(ip)) return "";
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 3000);
+    const res = await fetch(
+      `http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,city,regionName,country`,
+      { signal: ctrl.signal },
+    );
+    clearTimeout(t);
+    if (!res.ok) return "";
+    const body: any = await res.json();
+    if (body?.status !== "success") return "";
+    return [body.city, body.regionName, body.country].filter(Boolean).join(", ");
+  } catch {
+    return "";
+  }
+}
+
+function istNow(): string {
+  try {
+    return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short" });
+  } catch {
+    return new Date().toISOString();
+  }
+}
+
+export function buildWelcomeEmail(name: string, email: string): { to: string; subject: string; text: string; html: string } {
+  const display = esc(cleanName(name) || "there");
+  const text = [
+    `Hi ${cleanName(name) || "there"},`,
+    `Welcome to Locora! Your account (${email}) is ready.`,
+    `Discover events near you: https://locora-hyperlocal.vercel.app/discover`,
+  ].join("\n\n");
+  const html = emailLayout(
+    "Welcome to Locora",
+    bodyText(`Hi ${display},`) +
+      bodyText(`Welcome to Locora! Your account (${esc(email)}) is ready.`) +
+      primaryButton("Discover events near you", `${SITE_URL}/discover`),
+  );
+  return { to: email, subject: "Welcome to Locora", text, html };
+}
+
+export function buildLoginEmail(email: string, device: string, location: string, ip: string): { to: string; subject: string; text: string; html: string } {
+  const when = `${istNow()} (IST)`;
+  const loc = location || "Unknown location";
+  const lines = [
+    `There was a new sign-in to your Locora account (${email}).`,
+    `When: ${when}`,
+    `Device: ${device}`,
+    `Location: ${loc}`,
+    ip ? `IP address: ${ip}` : "",
+    `If this wasn't you, change your password right away.`,
+    `Secure your account:`,
+    `Change your password: ${SITE_URL}/forgot-password`,
+    `Sign out: ${SITE_URL}/logout`,
+    `The sign-out link signs out the device that opens it.`,
+  ].filter(Boolean);
+  const text = lines.join("\n\n");
+  const html = emailLayout(
+    "New sign-in to your account",
+    bodyText(`There was a new sign-in to your Locora account (${esc(email)}).`) +
+      detailRow("When", esc(when)) +
+      detailRow("Device", esc(device)) +
+      detailRow("Location", esc(loc)) +
+      (ip ? detailRow("IP address", esc(ip)) : "") +
+      `<div style="background:#FAF8F5;border:1px solid #E7E3DB;border-radius:12px;padding:14px 16px;margin-top:16px;font-size:15px;line-height:1.6;color:#1E2320;font-weight:600;">If this wasn't you, change your password right away.</div>` +
+      `<h2 style="font-family:Georgia,'Times New Roman',serif;font-size:17px;line-height:1.3;color:#1E3F35;margin:24px 0 12px;">Secure your account</h2>` +
+      primaryButton("Change your password", `${SITE_URL}/forgot-password`) +
+      `<p style="margin:12px 0 0;">${secondaryButton("Sign out", `${SITE_URL}/logout`)}</p>` +
+      `<p style="margin:12px 0 0;font-size:13px;line-height:1.6;color:#5F635D;">The sign-out link signs out the device that opens it.</p>`,
+  );
+  return { to: email, subject: "New sign-in to your Locora account", text, html };
+}
+
+async function sendMail(mail: { to: string; subject: string; text: string; html: string } | null): Promise<boolean> {
+  const user = getEnv("GMAIL_USER");
+  const pass = getEnv("GMAIL_APP_PASSWORD");
+  if (!user || !pass || !mail) return false;
+  try {
+    const nodemailer = (await import("nodemailer")).default;
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: { user, pass: pass.replace(/\s+/g, "") },
+    });
+    await transporter.sendMail({ from: user, ...mail });
+    return true;
+  } catch (err) {
+    console.warn("Account email failed:", err);
+    return false;
+  }
+}
+
+// email_log lookups. Returns null when the table cannot be read
+// (missing table, bad response), which the handler treats as
+// fail-closed: no mail without a working cap check.
+async function hasWelcome(email: string): Promise<boolean | null> {
+  const url =
+    `${supabaseBase()}/rest/v1/email_log?select=created_at` +
+    `&email=eq.${encodeURIComponent(email)}&kind=eq.welcome&limit=1`;
+  const { ok, body } = await fetchJson(url, { headers: supabaseHeaders() });
+  if (!ok || !Array.isArray(body)) return null;
+  return body.length > 0;
+}
+
+async function loginCountLastHour(email: string): Promise<number | null> {
+  const since = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const url =
+    `${supabaseBase()}/rest/v1/email_log?select=created_at` +
+    `&email=eq.${encodeURIComponent(email)}&kind=eq.login&created_at=gte.${encodeURIComponent(since)}`;
+  const { ok, body } = await fetchJson(url, { headers: supabaseHeaders() });
+  if (!ok || !Array.isArray(body)) return null;
+  return body.length;
+}
+
+async function logSend(email: string, kind: string): Promise<void> {
+  try {
+    await fetchJson(`${supabaseBase()}/rest/v1/email_log`, {
+      method: "POST",
+      headers: supabaseHeaders(),
+      body: JSON.stringify({ email, kind }),
+    });
+  } catch {
+    // A missed log row only risks a duplicate mail later, never a
+    // failed sign-in; the caller already succeeded.
+  }
+}
+
+export default async function handler(req: any, res: any): Promise<void> {
+  try {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { message: "POST only" });
+      return;
+    }
+    const session = await verifySession(req);
+    if (!session) {
+      sendJson(res, 401, { message: "Sign in required" });
+      return;
+    }
+    if (!getEnv("SUPABASE_URL") || !getEnv("SUPABASE_SERVICE_ROLE_KEY")) {
+      sendJson(res, 503, { message: "Shared email log is not configured. See ACCOUNT_EMAILS_SETUP.md." });
+      return;
+    }
+    const body = await readBody(req);
+    const action = body?.action;
+    const email = norm(body?.email || "");
+    if ((action !== "welcome" && action !== "login") || !validEmail(email)) {
+      sendJson(res, 400, { message: "Pass action 'welcome' or 'login' and a valid email." });
+      return;
+    }
+    if (email !== session.email) {
+      sendJson(res, 401, { message: "Sign in required" });
+      return;
+    }
+
+    if (action === "welcome") {
+      const already = await hasWelcome(email);
+      if (already === null) {
+        sendJson(res, 200, { mailed: false, reason: "email-log-unavailable" });
+        return;
+      }
+      if (already) {
+        sendJson(res, 200, { mailed: false, reason: "already-welcomed" });
+        return;
+      }
+      const sent = await sendMail(buildWelcomeEmail(body?.name || "", email));
+      if (sent) await logSend(email, "welcome");
+      sendJson(res, 200, { mailed: sent, reason: sent ? undefined : "not-configured" });
+      return;
+    }
+
+    // action === "login"
+    const count = await loginCountLastHour(email);
+    if (count === null) {
+      sendJson(res, 200, { mailed: false, reason: "email-log-unavailable" });
+      return;
+    }
+    if (count >= 5) {
+      sendJson(res, 200, { mailed: false, reason: "rate-limited" });
+      return;
+    }
+    const forwarded = req.headers?.["x-forwarded-for"] || req.headers?.["X-Forwarded-For"] || "";
+    const ip = String(forwarded).split(",")[0].trim();
+    const ua = req.headers?.["user-agent"] || req.headers?.["User-Agent"] || "";
+    const device = parseDevice(String(ua));
+    const location = await getLocation(ip);
+    const sent = await sendMail(buildLoginEmail(email, device, location, ip));
+    if (sent) await logSend(email, "login");
+    sendJson(res, 200, { mailed: sent, reason: sent ? undefined : "not-configured" });
+    return;
+  } catch (err) {
+    console.warn("notify handler failed:", err);
+    sendJson(res, 200, { mailed: false, reason: "error" });
+  }
+}
