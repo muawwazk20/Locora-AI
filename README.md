@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Locora — Hyperlocal Event Discovery & Community Engagement
 
 > **Discover nearby. Connect locally.**
@@ -101,3 +102,6 @@ To connect your independently developed REST backend (e.g., built in VS Code):
 You can switch roles anytime using the top navigation bar menu or demo banner:
 - **Attendee:** Sarah Chen (`sarah.chen@example.com`)
 - **Organizer:** Marcus Vance (`marcus@civictech.demo`)
+=======
+# Locora-AI
+>>>>>>> origin/main
